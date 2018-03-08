@@ -1,0 +1,179 @@
+#!/bin/sh
+
+# Copyright (C)2006,2007 USAGI/WIDE Project. All rights reserved.
+# Adapted by Martin Andre <andre@hongo.wide.ad.jp>
+# Further modified by Arnaud Ebalard <arno@natisbad.org>
+
+### BEGIN INIT INFO
+# Provides:          mip6d
+# Required-Start:    $network $syslog
+# Required-Stop:     $network $syslog
+# Should-Start:      $local_fs
+# Should-Stop:       $local_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Start/Stop MIPv6 Deamon (UMIP)
+# Description:       (empty)
+### END INIT INFO
+
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+DESC="UMIP daemon"
+NAME=mip6d
+MIP6D=/usr/local/sbin/mip6d
+MIP6D_CONF=/usr/local/etc/mip6d.conf
+MIP6D_DEBUG_LOG=/var/log/mip6d.log
+PIDFILE=/var/run/mip6d.pid
+FORCE_IPV6_FORWARDING="no"
+RUN="no"
+
+. /lib/lsb/init-functions
+
+DIETIME=1
+
+# Include defaults if available
+if [ -f /etc/default/$NAME ] ; then
+	. /etc/default/$NAME
+fi
+
+if [ "x$RUN" != "xyes" ] ; then
+    log_failure_msg "$NAME disabled, please adjust the configuration to your needs"
+    log_failure_msg "and then set RUN to 'yes' in /etc/default/$NAME to enable it."
+    exit 1
+fi
+
+if [ ! -e $MIP6D_CONF ]; then
+    log_failure_msg "ERROR: $MIP6D_CONF does not exist."
+    log_failure_msg "       See mip6d.conf(5) for configuration file syntax and"
+    log_failure_msg "       sample configuration elements."
+    log_failure_msg "    => $DESC will not be started"
+    exit 0
+fi
+
+if [ ! -x $MIP6D ]; then
+    log_failure_msg "ERROR: While trying to start $DESC, found its binary was"
+    log_failure_msg "       missing ($MIP6D)."
+    log_failure_msg "    => $DESC will not be started"
+    exit 0
+fi
+
+if [ ! -e /proc/sys/net/ipv6 ]; then
+    log_failure_msg "ERROR: In-kernel IPv6 is required for $DESC to work."
+    log_failure_msg "    => $DESC will not be started."
+    exit 0
+fi
+
+set -e
+
+MIP6D_OPTS="-c ${MIP6D_CONF}"
+if [ x"$MIP6D_DEBUG_LOG" != x"" ]; then
+    MIP6D_OPTS="${MIP6D_OPTS} -l ${MIP6D_DEBUG_LOG}"
+fi
+
+post_war_cleaning()
+{
+    # clean-up XFRM (BCE/BUL)
+    for t in sub main; do
+	ip xfrm policy flush ptype ${t} > /dev/null 2>&1 || true
+    done
+
+    for p in esp ah comp route2 hao; do
+	ip xfrm state flush proto ${p} > /dev/null 2>&1 || true
+    done
+
+    # clean-up tunnel device
+    tnls=`ifconfig -a  | awk '/^ip6tnl/ { print $1 }'`
+    for tnl in $tnls; do
+	ip -6 tunnel del $tnl > /dev/null 2>&1 || true
+    done
+
+    # clean-up neighbor cache
+    devices=`ip link 2>&1 | grep '^[0-9]' | awk '{print $2}' | sed -e 's/:$//'`
+    for dev in $devices; do
+        ip neigh flush dev $dev > /dev/null 2>&1  || true
+    done
+
+    return 0
+}
+
+case "$1" in
+  start)
+        echo -n "Starting MIP6D: "
+        PID=x`pgrep -f $MIP6D || true`
+        if [ "${PID}" != "x" ] ; then
+            echo "failed (already started)."
+            exit 0
+        fi
+	if [ x"$FORCE_IPV6_FORWARDING" = x"yes" ]; then
+		echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+	fi
+        start-stop-daemon --start  --quiet --exec ${MIP6D} -- ${MIP6D_OPTS}
+        echo "done."
+        ;;
+
+  stop)
+        echo -n "Stopping MIP6D: "
+        PID=x`pgrep -f $MIP6D || true`
+        if [ "${PID}" = "x" ] ; then
+            echo "done (none found)."
+            exit 0
+        fi
+
+	# Be nice ...
+	HOW=""
+        pkill -f ${MIP6D}
+        sleep $DIETIME
+
+	# Hum, you did not understand. Louder ...
+        PID=x`pgrep -f $MIP6D || true`
+        if [ "${PID}" != "x" ] ; then
+            pkill -TERM -f ${MIP6D} || true
+            sleep $DIETIME
+            PID=x`pgrep -f $MIP6D || true`
+            if [ "${PID}" != "x" ] ; then
+		post_war_cleaning
+	    fi
+	    HOW=" (TERMinated)"
+        fi
+
+	# Ok, go to hell ...
+        PID=x`pgrep -f $MIP6D || true`
+        if [ "${PID}" != "x" ] ; then
+            pkill -KILL -f ${MIP6D} || true
+	    sleep $DIETIME
+	    post_war_cleaning
+	    HOW=" (KILLed)"
+            exit 0
+        fi
+
+        echo "done.${HOW}"
+        ;;
+
+  reload)
+        echo -n "Reloading MIP6D: "
+	pkill -HUP -f ${MIP6D} || true
+        echo "done."
+	;;
+
+  restart|force-reload)
+        $0 stop
+        $0 start
+        ;;
+
+  status)
+	status=" NOT"
+        PID=x`pgrep -f $MIP6D || true`
+        if [ "${PID}" != "x" ] ; then
+	    status=""
+        fi
+	echo "${DESC} (${NAME}) is${status} running."
+	exit 0
+	;;
+  *)
+        N=/etc/init.d/$NAME
+        echo "Usage: $N {start|stop|restart|force-reload|status}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
